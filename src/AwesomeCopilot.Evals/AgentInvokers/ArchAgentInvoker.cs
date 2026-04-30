@@ -46,11 +46,30 @@ public sealed class ArchAgentInvoker
     }
 
     /// <summary>
+    /// Creates an <see cref="IChatClient"/> using the given API key and optional endpoint/model overrides.
+    /// </summary>
+    /// <param name="apiKey">The API key (e.g. GitHub personal access token).</param>
+    /// <param name="endpoint">Endpoint URI. Defaults to <see cref="DefaultEndpoint"/>.</param>
+    /// <param name="model">Model identifier. Defaults to <see cref="DefaultModel"/>.</param>
+    /// <returns>A configured <see cref="IChatClient"/>.</returns>
+    public static IChatClient CreateChatClient(string apiKey, string? endpoint = null, string? model = null)
+    {
+        var resolvedEndpoint = endpoint ?? DefaultEndpoint;
+        var resolvedModel = model ?? DefaultModel;
+
+        var openAIClient = new OpenAIClient(
+            new ApiKeyCredential(apiKey),
+            new OpenAIClientOptions { Endpoint = new Uri(resolvedEndpoint) });
+
+        return openAIClient.GetChatClient(resolvedModel).AsIChatClient();
+    }
+
+    /// <summary>
     /// Creates an <see cref="ArchAgentInvoker"/> from environment variables.
     /// Requires <c>GITHUB_TOKEN</c> to be set.
     /// </summary>
     /// <param name="systemPrompt">
-    /// The system prompt to use. When <c>null</c>, the built-in arch.agent.md prompt is used.
+    /// The system prompt to use. When <c>null</c>, the prompt is loaded from <c>agents/arch.agent.md</c>.
     /// </param>
     /// <returns>A configured <see cref="ArchAgentInvoker"/>.</returns>
     /// <exception cref="InvalidOperationException">
@@ -63,15 +82,8 @@ public sealed class ArchAgentInvoker
                 "GITHUB_TOKEN environment variable is not set. " +
                 "Set it to a GitHub personal access token or GitHub Copilot token.");
 
-        var endpoint = DefaultEndpoint;
-        var model = DefaultModel;
-
-        var openAIClient = new OpenAIClient(
-            new ApiKeyCredential(apiKey),
-            new OpenAIClientOptions { Endpoint = new Uri(endpoint) });
-
-        var chatClient = openAIClient.GetChatClient(model).AsIChatClient();
-        var prompt = systemPrompt ?? GetBuiltInSystemPrompt();
+        var chatClient = CreateChatClient(apiKey);
+        var prompt = systemPrompt ?? LoadSystemPromptFromAgentFile();
 
         return new ArchAgentInvoker(chatClient, prompt);
     }
@@ -98,34 +110,57 @@ public sealed class ArchAgentInvoker
     }
 
     /// <summary>
-    /// Returns the built-in system prompt that embeds the key arch.agent.md constraints.
-    /// This covers the "no code generation" rule and diagram/documentation focus used in evaluations.
+    /// Loads the system prompt from the <c>agents/arch.agent.md</c> file in the repository,
+    /// stripping any YAML front matter before returning the content.
     /// </summary>
-    public static string GetBuiltInSystemPrompt() =>
-        """
-        You are a Senior Cloud Architect with deep expertise in:
-        - Modern architecture design patterns (microservices, event-driven, serverless, etc.)
-        - Non-Functional Requirements (NFR) including scalability, performance, security, reliability, maintainability
-        - Cloud-native technologies and best practices
-        - Enterprise architecture frameworks
-        - System design and architectural documentation
+    /// <param name="agentFilePath">
+    /// Explicit path to the agent file. When <c>null</c>, the file is located by walking up
+    /// from <see cref="AppContext.BaseDirectory"/> until <c>agents/arch.agent.md</c> is found.
+    /// </param>
+    /// <returns>The system prompt extracted from the agent file.</returns>
+    public static string LoadSystemPromptFromAgentFile(string? agentFilePath = null)
+    {
+        var path = agentFilePath ?? FindAgentFilePath();
+        var content = File.ReadAllText(path);
+        return StripFrontMatter(content);
+    }
 
-        ## Important Guidelines
+    /// <summary>
+    /// Walks up the directory tree from <see cref="AppContext.BaseDirectory"/> to locate
+    /// <c>agents/arch.agent.md</c>.
+    /// </summary>
+    private static string FindAgentFilePath()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            var candidate = Path.Combine(dir.FullName, "agents", "arch.agent.md");
+            if (File.Exists(candidate))
+                return candidate;
+            dir = dir.Parent;
+        }
 
-        **NO CODE GENERATION**: You should NOT generate any code. Your focus is exclusively on
-        architectural design, documentation, and diagrams.
+        throw new FileNotFoundException(
+            "Could not find agents/arch.agent.md. " +
+            "Ensure the test is run from within the repository.");
+    }
 
-        ## Output Format
+    /// <summary>
+    /// Removes YAML front matter (delimited by <c>---</c> lines) from the beginning of
+    /// <paramref name="content"/> and returns the remaining text.
+    /// </summary>
+    private static string StripFrontMatter(string content)
+    {
+        var lines = content.ReplaceLineEndings("\n").Split('\n');
+        if (lines[0].Trim() != "---")
+            return content;
 
-        Create all architectural diagrams and documentation using Mermaid syntax.
+        for (var i = 1; i < lines.Length; i++)
+        {
+            if (lines[i].Trim() == "---")
+                return string.Join("\n", lines.Skip(i + 1)).TrimStart('\n');
+        }
 
-        For every architectural assessment, create:
-        1. System Context Diagram
-        2. Component Diagram
-        3. Deployment Diagram
-
-        For every diagram provide: overview, key components, relationships, design decisions,
-        NFR considerations (scalability, performance, security, reliability, maintainability),
-        trade-offs, and risks.
-        """;
+        return content;
+    }
 }

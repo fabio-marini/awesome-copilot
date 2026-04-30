@@ -1,8 +1,6 @@
-using System.ClientModel;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.AI.Evaluation;
 using Microsoft.Extensions.AI.Evaluation.Quality;
-using OpenAI;
 using Xunit;
 using AwesomeCopilot.Evals.AgentInvokers;
 
@@ -139,14 +137,7 @@ public class ArchAgentTestCase
     private static IChatClient CreateJudgeChatClient()
     {
         var apiKey = Environment.GetEnvironmentVariable("GITHUB_TOKEN")!;
-        var endpoint = ArchAgentInvoker.DefaultEndpoint;
-        var model = ArchAgentInvoker.DefaultModel;
-
-        var openAIClient = new OpenAIClient(
-            new ApiKeyCredential(apiKey),
-            new OpenAIClientOptions { Endpoint = new Uri(endpoint) });
-
-        return openAIClient.GetChatClient(model).AsIChatClient();
+        return ArchAgentInvoker.CreateChatClient(apiKey);
     }
 
     /// <summary>
@@ -155,9 +146,10 @@ public class ArchAgentTestCase
     /// </summary>
     private static void AssertNoCodeBlocks(string responseText)
     {
-        // Collect all fenced code-block language identifiers (e.g. ```csharp, ```python)
+        // Collect all fenced code-block language identifiers (e.g. ```csharp, ```c#, ```json5)
+        // anchored at the start of each line so inline backticks are not mismatched.
         var codeBlockLanguages = new System.Text.RegularExpressions.Regex(
-            @"```([a-zA-Z]+)",
+            @"^```([a-zA-Z][a-zA-Z0-9+#\-]*)",
             System.Text.RegularExpressions.RegexOptions.Multiline);
 
         var matches = codeBlockLanguages.Matches(responseText);
