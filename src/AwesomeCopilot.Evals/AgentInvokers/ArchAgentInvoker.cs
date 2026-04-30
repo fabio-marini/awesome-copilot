@@ -1,32 +1,34 @@
 using System.ClientModel;
+using GitHub.Copilot.SDK;
 using Microsoft.Extensions.AI;
 using OpenAI;
 
 namespace AwesomeCopilot.Evals.AgentInvokers;
 
 /// <summary>
-/// Invokes the arch.agent.md (Senior Cloud Architect) agent using an OpenAI-compatible chat client.
-/// Supports GitHub Models (https://models.inference.ai.azure.com) and GitHub Copilot API endpoints.
+/// Invokes the arch.agent.md (Senior Cloud Architect) agent using the official GitHub Copilot SDK.
+/// The AI-judge client used by quality evaluators is created separately via <see cref="CreateChatClient"/>.
 /// </summary>
 public sealed class ArchAgentInvoker
 {
     /// <summary>
-    /// Default GitHub Models endpoint (OpenAI-compatible).
-    /// Set GITHUB_MODELS_ENDPOINT to override (e.g. for GitHub Copilot API).
+    /// GitHub Models endpoint used by the AI-judge chat client.
+    /// Set <c>GITHUB_MODELS_ENDPOINT</c> to override (e.g. for the GitHub Copilot API).
     /// </summary>
     public static readonly string DefaultEndpoint =
         Environment.GetEnvironmentVariable("GITHUB_MODELS_ENDPOINT")
         ?? "https://models.inference.ai.azure.com";
 
     /// <summary>
-    /// Default model to use when invoking the agent.
-    /// Set GITHUB_MODELS_MODEL to override.
+    /// Model identifier used both for Copilot sessions and the AI-judge client.
+    /// Set <c>GITHUB_MODELS_MODEL</c> to override.
     /// </summary>
     public static readonly string DefaultModel =
         Environment.GetEnvironmentVariable("GITHUB_MODELS_MODEL")
         ?? "gpt-4o";
 
-    private readonly IChatClient _chatClient;
+    private readonly CopilotClientOptions _clientOptions;
+    private readonly string _model;
     private readonly string _systemPrompt;
 
     /// <summary>
@@ -37,16 +39,19 @@ public sealed class ArchAgentInvoker
         "Your focus is exclusively on architectural design, documentation, and diagrams.";
 
     /// <summary>
-    /// Initialises the invoker with a pre-configured <see cref="IChatClient"/> and system prompt.
+    /// Initialises the invoker with the given <see cref="CopilotClientOptions"/>, system prompt,
+    /// and model identifier.
     /// </summary>
-    public ArchAgentInvoker(IChatClient chatClient, string systemPrompt)
+    public ArchAgentInvoker(CopilotClientOptions clientOptions, string systemPrompt, string model)
     {
-        _chatClient = chatClient;
+        _clientOptions = clientOptions;
         _systemPrompt = systemPrompt;
+        _model = model;
     }
 
     /// <summary>
-    /// Creates an <see cref="IChatClient"/> using the given API key and optional endpoint/model overrides.
+    /// Creates an <see cref="IChatClient"/> for use by AI-judge quality evaluators.
+    /// Uses the GitHub Models endpoint (OpenAI-compatible).
     /// </summary>
     /// <param name="apiKey">The API key (e.g. GitHub personal access token).</param>
     /// <param name="endpoint">Endpoint URI. Defaults to <see cref="DefaultEndpoint"/>.</param>
@@ -65,8 +70,8 @@ public sealed class ArchAgentInvoker
     }
 
     /// <summary>
-    /// Creates an <see cref="ArchAgentInvoker"/> from environment variables.
-    /// Requires <c>GITHUB_TOKEN</c> to be set.
+    /// Creates an <see cref="ArchAgentInvoker"/> from environment variables using the
+    /// official GitHub Copilot SDK. Requires <c>GITHUB_TOKEN</c> to be set.
     /// </summary>
     /// <param name="systemPrompt">
     /// The system prompt to use. When <c>null</c>, the prompt is loaded from <c>agents/arch.agent.md</c>.
@@ -80,31 +85,58 @@ public sealed class ArchAgentInvoker
         var apiKey = Environment.GetEnvironmentVariable("GITHUB_TOKEN")
             ?? throw new InvalidOperationException(
                 "GITHUB_TOKEN environment variable is not set. " +
-                "Set it to a GitHub personal access token or GitHub Copilot token.");
+                "Set it to a GitHub personal access token with GitHub Copilot access.");
 
-        var chatClient = CreateChatClient(apiKey);
+        var options = new CopilotClientOptions { GitHubToken = apiKey };
         var prompt = systemPrompt ?? LoadSystemPromptFromAgentFile();
 
-        return new ArchAgentInvoker(chatClient, prompt);
+        return new ArchAgentInvoker(options, prompt, DefaultModel);
     }
 
     /// <summary>
-    /// Invokes the arch agent with the provided user message and returns the raw <see cref="ChatResponse"/>.
+    /// Invokes the arch agent via the GitHub Copilot SDK and returns the response alongside
+    /// the reconstructed conversation history for use by downstream evaluators.
     /// </summary>
     /// <param name="userMessage">The user's architecture request.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
-    /// <returns>The agent's <see cref="ChatResponse"/>.</returns>
+    /// <returns>
+    /// A tuple of the conversation messages (system + user) and the agent's
+    /// <see cref="ChatResponse"/>, compatible with <c>Microsoft.Extensions.AI.Evaluation</c> evaluators.
+    /// </returns>
     public async Task<(IReadOnlyList<ChatMessage> Messages, ChatResponse Response)> InvokeAsync(
         string userMessage,
         CancellationToken cancellationToken = default)
     {
+        await using var client = new CopilotClient(_clientOptions);
+        await client.StartAsync(cancellationToken);
+
+        await using var session = await client.CreateSessionAsync(new SessionConfig
+        {
+            Model = _model,
+            SystemMessage = new SystemMessageConfig { Content = _systemPrompt },
+            // ApproveAll is safe here: arch.agent.md is a documentation-only agent that does
+            // not invoke any tools, so no tool calls will be requested during evaluation.
+            OnPermissionRequest = PermissionHandler.ApproveAll,
+        }, cancellationToken);
+
+        var assistantMessage = await session.SendAndWaitAsync(
+            new MessageOptions { Prompt = userMessage },
+            timeout: null,
+            cancellationToken: cancellationToken);
+
+        if (assistantMessage is null)
+            throw new InvalidOperationException(
+                "The Copilot agent returned no response. " +
+                "Verify that GITHUB_TOKEN has the required Copilot access and the endpoint is reachable.");
+
         var messages = new List<ChatMessage>
         {
             new ChatMessage(ChatRole.System, _systemPrompt),
             new ChatMessage(ChatRole.User, userMessage),
         };
 
-        var response = await _chatClient.GetResponseAsync(messages, cancellationToken: cancellationToken);
+        var response = new ChatResponse(
+            new ChatMessage(ChatRole.Assistant, assistantMessage.Data?.Content ?? string.Empty));
 
         return (messages, response);
     }
